@@ -56,7 +56,9 @@ fun RoleSelectionScreen(
         verticalArrangement = Arrangement.SpaceBetween
     ) {
         Column(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
@@ -103,6 +105,8 @@ fun RoleSelectionScreen(
                 onClick = { selectedRole = "artist" }
             )
         }
+
+        Spacer(modifier = Modifier.height(20.dp))
 
         Button(
             onClick = {

@@ -1,5 +1,14 @@
 package com.titu.artistonboard
 
+import com.titu.artistonboard.supabase.SupabaseArtistOnboardingViewModel
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.collectAsState
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
+import java.io.File
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.BorderStroke
@@ -52,8 +61,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -82,6 +94,9 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Phone
+import com.titu.artistonboard.supabase.SupabaseArtistOnboardingRepository
+import com.titu.artistonboard.supabase.SupabaseAuthRepository
+import com.titu.artistonboard.supabase.SupabaseStorageRepository
 import com.titu.artistonboard.ui.components.InputField
 import com.titu.artistonboard.ui.components.OptionCard
 import com.titu.artistonboard.ui.components.PrimaryButton
@@ -98,8 +113,13 @@ import java.time.YearMonth
 import java.time.format.DateTimeFormatter
 import java.text.NumberFormat
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.regex.Pattern
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.add
 import kotlin.math.exp
 import kotlin.math.ln
 
@@ -118,7 +138,7 @@ private fun formatRupee(value: Float): String {
 
 private class RupeeVisualTransformation : VisualTransformation {
     override fun filter(text: AnnotatedString): TransformedText {
-        val digits = text.text
+        val digits = text.text.filter { it.isDigit() }
         if (digits.isEmpty()) {
             return TransformedText(AnnotatedString(""), OffsetMapping.Identity)
         }
@@ -164,6 +184,9 @@ private class RupeeVisualTransformation : VisualTransformation {
     }
 }
 
+
+
+val LocalArtistViewModel = staticCompositionLocalOf<SupabaseArtistOnboardingViewModel> { error("No ViewModel provided") }
 
 @Composable
 fun WelcomeScreen(
@@ -256,14 +279,26 @@ fun WelcomeScreen(
 @Composable
 fun NameCityScreen(
     onBack: () -> Unit,
-    onContinue: () -> Unit
+    onContinue: () -> Unit,
+    onCompletedArtistLogin: () -> Unit = {}
 ) {
-    var fullName by remember { mutableStateOf("Test Artist") }
-    var whatsappNumber by remember { mutableStateOf("9876543210") }
-    var emailId by remember { mutableStateOf("artist@test.com") }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val authRepository = remember { SupabaseAuthRepository() }
+    val onboardingRepository = remember { SupabaseArtistOnboardingRepository() }
+    var fullName by remember { mutableStateOf("") }
+    var whatsappNumber by remember { mutableStateOf("") }
+    var emailId by remember { mutableStateOf("") }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isSavingIdentity by remember { mutableStateOf(false) }
     val isValidPhone = whatsappNumber.length == 10
     val isValidEmail = emailId.isNotBlank() && EmailRegex.matcher(emailId).matches()
-    val canContinue = fullName.isNotBlank() && isValidPhone && isValidEmail
+    val formattedPhone = remember(whatsappNumber) { formatIndianPhoneNumber(whatsappNumber) }
+    val canContinue = fullName.isNotBlank() &&
+        isValidPhone &&
+        isValidEmail &&
+        !isSavingIdentity
 
     Column(
         modifier = Modifier
@@ -280,7 +315,13 @@ fun NameCityScreen(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "What's your name?",
+                    text = "Step 1 of 14",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary
+                )
+
+                Text(
+                    text = "Verify your identity",
                     style = MaterialTheme.typography.headlineSmall.copy(
                         fontWeight = FontWeight.SemiBold,
                         fontFamily = BodoniModa,
@@ -292,7 +333,7 @@ fun NameCityScreen(
                 )
 
                 Text(
-                    text = "Enter your basic information",
+                    text = "Confirm your details with OTP and a live selfie.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = TextSecondary
                 )
@@ -307,6 +348,7 @@ fun NameCityScreen(
                     iconTint = BurntOrange,
                     highlight = true
                 )
+
 
                 BasicInfoInput(
                     value = whatsappNumber,
@@ -331,7 +373,11 @@ fun NameCityScreen(
 
                 BasicInfoInput(
                     value = emailId,
-                    onValueChange = { emailId = it },
+                    onValueChange = { 
+                        emailId = it 
+                        errorMessage = null
+                        statusMessage = null
+                    },
                     placeholder = "Enter your email ID",
                     icon = Icons.Default.Email,
                     iconTint = BurntOrange,
@@ -347,13 +393,88 @@ fun NameCityScreen(
                     )
                 }
 
+                OtpVerificationInput(
+                    value = "",
+                    otpSent = false,
+                    otpVerified = false,
+                    onValueChange = {},
+                    onActionClick = {
+                        statusMessage = "OTP verification is disabled for now."
+                        errorMessage = null
+                    },
+                    actionEnabled = false,
+                    isActionInProgress = false
+                )
+
+                LiveSelfieUploadCard(
+                    uploaded = false,
+                    isUploading = false,
+                    otpVerified = false,
+                    onUploadClick = {
+                        statusMessage = "Live selfie capture is disabled for now."
+                        errorMessage = null
+                    }
+                )
+
+                statusMessage?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF2E7D32),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                errorMessage?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFB04A2A),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
                 Spacer(modifier = Modifier.height(12.dp))
             }
 
             Spacer(modifier = Modifier.weight(1f))
 
         Button(
-            onClick = onContinue,
+            onClick = {
+                scope.launch {
+                    isSavingIdentity = true
+                    errorMessage = null
+                    statusMessage = "Saving your identity..."
+                    try {
+                        authRepository.startLocalEmailSession(emailId.trim())
+                        onboardingRepository.upsertProfile(
+                            role = "artist",
+                            fullName = fullName.trim(),
+                            phone = formattedPhone,
+                            email = emailId.trim()
+                        )
+                        onboardingRepository.upsertArtistProfile(
+                            brandName = fullName.trim(),
+                            city = "",
+                            state = "",
+                            liveSelfiePath = null,
+                            identityVerified = false
+                        )
+                        val profile = onboardingRepository.fetchArtistProfile()
+                        if (profile?.toString()?.contains("\"onboarding_status\":\"completed\"") == true) {
+                            onCompletedArtistLogin()
+                        } else {
+                            statusMessage = "Identity saved."
+                            onContinue()
+                        }
+                    } catch (exception: Exception) {
+                        errorMessage = exception.message ?: "Unable to save your identity right now."
+                        statusMessage = null
+                    } finally {
+                        isSavingIdentity = false
+                    }
+                }
+            },
             enabled = canContinue,
             modifier = Modifier
                 .fillMaxWidth()
@@ -367,7 +488,11 @@ fun NameCityScreen(
             )
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(text = "Continue", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    text = if (isSavingIdentity) "Saving..." else "Continue",
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold
+                )
                 Spacer(modifier = Modifier.width(6.dp))
                 Icon(imageVector = Icons.Default.ChevronRight, contentDescription = null)
             }
@@ -375,6 +500,161 @@ fun NameCityScreen(
 
         Spacer(modifier = Modifier.height(28.dp))
     }
+}
+
+@Composable
+private fun OtpVerificationInput(
+    value: String,
+    otpSent: Boolean,
+    otpVerified: Boolean,
+    onValueChange: (String) -> Unit,
+    onActionClick: () -> Unit,
+    actionEnabled: Boolean,
+    isActionInProgress: Boolean
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(60.dp)
+            .background(Color.White, RoundedCornerShape(20.dp))
+            .border(1.dp, BorderSoft, RoundedCornerShape(20.dp))
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Default.Email,
+            contentDescription = null,
+            tint = BurntOrange,
+            modifier = Modifier.size(24.dp)
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            keyboardOptions = KeyboardOptions.Default.copy(keyboardType = KeyboardType.Number),
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = TextPrimary),
+            decorationBox = { innerTextField ->
+                if (value.isBlank()) {
+                    Text(
+                        text = if (otpSent) "Enter OTP" else "Send OTP",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = TextSecondary
+                    )
+                }
+                innerTextField()
+            },
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Box(
+            modifier = Modifier
+                .background(
+                    if (actionEnabled) BurntOrange.copy(alpha = 0.14f) else BorderSoft.copy(alpha = 0.45f),
+                    RoundedCornerShape(14.dp)
+                )
+                .clickable(enabled = actionEnabled && !otpVerified && !isActionInProgress) { onActionClick() }
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = when {
+                    isActionInProgress -> if (otpSent) "Verifying..." else "Sending..."
+                    otpVerified -> "Verified"
+                    otpSent -> "Verify OTP"
+                    else -> "Send OTP"
+                },
+                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                color = if (actionEnabled) BurntOrange else TextSecondary
+            )
+        }
+    }
+}
+
+@Composable
+private fun LiveSelfieUploadCard(
+    uploaded: Boolean,
+    isUploading: Boolean,
+    otpVerified: Boolean,
+    onUploadClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Color.White,
+        border = BorderStroke(1.dp, if (uploaded) BurntOrange.copy(alpha = 0.35f) else BorderSoft),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "Capture live selfie",
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = TextPrimary
+                )
+                Text(
+                    text = when {
+                        uploaded -> "Live selfie uploaded successfully."
+                        isUploading -> "Uploading your live selfie..."
+                        otpVerified -> "Capture a live selfie for identity verification."
+                        else -> "Verify OTP first, then capture your live selfie."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Box(
+                modifier = Modifier
+                    .background(
+                        if (uploaded) BurntOrange else BurntOrange.copy(alpha = 0.12f),
+                        RoundedCornerShape(14.dp)
+                    )
+                    .clickable(enabled = !isUploading) { onUploadClick() }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = when {
+                        isUploading -> "Uploading"
+                        uploaded -> "Captured"
+                        else -> "Capture"
+                    },
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                    color = if (uploaded) Color.White else BurntOrange
+                )
+            }
+        }
+    }
+}
+
+private fun formatIndianPhoneNumber(number: String): String {
+    val digitsOnly = number.filter { it.isDigit() }
+    return if (digitsOnly.startsWith("91") && digitsOnly.length > 10) {
+        "+$digitsOnly"
+    } else {
+        "+91$digitsOnly"
+    }
+}
+
+private suspend fun readBytesFromUri(
+    context: android.content.Context,
+    uri: Uri
+): ByteArray = withContext(Dispatchers.IO) {
+    context.contentResolver.openInputStream(uri)?.use { inputStream ->
+        inputStream.readBytes()
+    } ?: error("Unable to read the selected image.")
+}
+
+
+private fun createImageUri(context: android.content.Context): Uri {
+    val file = File(context.cacheDir, "images").apply { mkdirs() }
+    val newFile = File(file, "selfie_${System.currentTimeMillis()}.jpg")
+    return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", newFile)
 }
 
 @Composable
@@ -433,8 +713,14 @@ fun CategoryScreen(
     onBack: () -> Unit,
     onNext: () -> Unit
 ) {
-    var selectedCategories by remember { mutableStateOf(emptySet<String>()) }
-    val canContinueCategory = selectedCategories.isNotEmpty()
+    val scope = rememberCoroutineScope()
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    val onboardingRepository = remember { SupabaseArtistOnboardingRepository() }
+    var selectedCategories by remember(state.selectedCategories) { mutableStateOf(state.selectedCategories) }
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val canContinueCategory = selectedCategories.isNotEmpty() && !isSaving
 
     Column(
         modifier = Modifier
@@ -453,6 +739,12 @@ fun CategoryScreen(
                 contentDescription = "Back",
                 tint = TextSecondary,
                 modifier = Modifier.clickable { onBack() }
+            )
+
+            Text(
+                text = "Step 2 of 14",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary
             )
 
             Text(
@@ -490,8 +782,36 @@ fun CategoryScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            errorMessage?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                )
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            viewModel.updateState { it.copy(selectedCategories = selectedCategories) }
+                            onboardingRepository.updateArtistProfilePartial(
+                                kotlinx.serialization.json.buildJsonObject {
+                                    put("categories", kotlinx.serialization.json.buildJsonArray {
+                                        selectedCategories.forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) }
+                                    })
+                                }
+                            )
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save categories"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 enabled = canContinueCategory,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -505,7 +825,7 @@ fun CategoryScreen(
                 )
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = "Next")
+                    Text(text = if (isSaving) "Saving..." else "Next")
                     Spacer(modifier = Modifier.width(6.dp))
                     Icon(imageVector = Icons.Default.ChevronRight, contentDescription = null)
                 }
@@ -597,8 +917,15 @@ fun StyleScreen(
         StyleCard("Modern", R.drawable.modern, BurntOrange),
         StyleCard("Boho", R.drawable.boho, Color(0xFFC97A4E))
     )
-    var selectedStyles by remember { mutableStateOf(emptySet<String>()) }
-    val canContinueStyle = selectedStyles.isNotEmpty()
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    
+    var selectedStyles by remember(state.selectedStyles) { mutableStateOf(state.selectedStyles) }
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    
+    val canContinueStyle = selectedStyles.isNotEmpty() && !isSaving
 
     Column(
         modifier = Modifier
@@ -617,6 +944,12 @@ fun StyleScreen(
                 contentDescription = "Back",
                 tint = TextSecondary,
                 modifier = Modifier.clickable { onBack() }
+            )
+
+            Text(
+                text = "Step 3 of 14",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary
             )
 
             Text(
@@ -647,8 +980,30 @@ fun StyleScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            errorMessage?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                )
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            viewModel.updateState { it.copy(selectedStyles = selectedStyles) }
+                            viewModel.saveIncrementalState()
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save styles"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 enabled = canContinueStyle,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -662,7 +1017,7 @@ fun StyleScreen(
                 )
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = "Next")
+                    Text(text = if (isSaving) "Saving..." else "Next")
                     Spacer(modifier = Modifier.width(6.dp))
                     Icon(imageVector = Icons.Default.ChevronRight, contentDescription = null)
                 }
@@ -749,7 +1104,13 @@ fun LiveArtServicesScreen(
     onSelectionChange: (Boolean) -> Unit,
     onNext: () -> Unit
 ) {
-    var liveServices by remember { mutableStateOf(true) }
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+
+    var liveServices by remember(state.offersLiveServices) { mutableStateOf(state.offersLiveServices) }
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize()) {
         androidx.compose.foundation.Image(
@@ -777,7 +1138,7 @@ fun LiveArtServicesScreen(
                 )
 
                 Text(
-                    text = "Step 5 of 11",
+                    text = "Step 4 of 14",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary
                 )
@@ -864,8 +1225,30 @@ fun LiveArtServicesScreen(
                 }
             }
 
+            errorMessage?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                )
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            viewModel.updateState { it.copy(offersLiveServices = liveServices) }
+                            viewModel.saveIncrementalState()
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
@@ -876,7 +1259,7 @@ fun LiveArtServicesScreen(
                 )
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = "Continue", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    Text(text = if (isSaving) "Saving..." else "Continue", fontSize = 22.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.width(8.dp))
                     Icon(imageVector = Icons.Default.ChevronRight, contentDescription = null)
                 }
@@ -893,11 +1276,24 @@ fun LiveArtModeScreen(
 ) {
     val liveTypes = listOf("Physical Live Art", "Virtual Live Art")
     val radiusOptions = listOf("10 km", "25 km", "50 km", "100 km")
-    var selectedType by remember { mutableStateOf(liveTypes.first()) }
-    var selectedCities by remember { mutableStateOf(setOf("Pune", "Mumbai")) }
-    var selectedRadius by remember { mutableStateOf(radiusOptions.first()) }
+    
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    
+    var selectedType by remember(state.liveArtMode) { mutableStateOf(state.liveArtMode.takeIf { it.isNotBlank() }) }
+    var selectedCities by remember(state.liveArtCities) { mutableStateOf(state.liveArtCities) }
+    var selectedRadius by remember(state.liveArtRadius) { mutableStateOf(state.liveArtRadius.takeIf { it > 0f }?.toInt()?.toString()?.plus(" km")) }
+    
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    
     val isPhysical = selectedType == liveTypes.first()
-    val canContinue = if (isPhysical) selectedCities.isNotEmpty() && selectedRadius.isNotBlank() else true
+    val canContinue = when (selectedType) {
+        liveTypes.first() -> selectedCities.isNotEmpty() && selectedRadius != null && !isSaving
+        liveTypes.last() -> !isSaving
+        else -> false
+    }
 
     Column(
         modifier = Modifier
@@ -919,7 +1315,7 @@ fun LiveArtModeScreen(
             )
 
             Text(
-                text = "Step 6 of 11",
+                text = "Step 5 of 14",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary
             )
@@ -946,7 +1342,7 @@ fun LiveArtModeScreen(
                 fillImageSlot = true,
                 imageOffsetX = (-6).dp,
                 cardHeight = 156.dp,
-                selected = isPhysical,
+                selected = selectedType == liveTypes.first(),
                 onClick = {
                     selectedType = liveTypes.first()
                     onTypeChange(true)
@@ -968,7 +1364,7 @@ fun LiveArtModeScreen(
                 titleFontSize = 17.sp,
                 titleMaxLines = 1,
                 cardHeight = 156.dp,
-                selected = !isPhysical,
+                selected = selectedType == liveTypes.last(),
                 onClick = {
                     selectedType = liveTypes.last()
                     onTypeChange(false)
@@ -984,8 +1380,16 @@ fun LiveArtModeScreen(
                 color = Color(0xFF4A3340)
             )
 
+            if (selectedType == null) {
+                Text(
+                    text = "Validation: Select how you offer live art to continue.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A)
+                )
+            }
+
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                listOf("Pune", "Mumbai").forEach { city ->
+                listOf("Pune", "Mumbai", "Bangalore").forEach { city ->
                     val selected = selectedCities.contains(city)
                     Box(
                         modifier = Modifier
@@ -1011,6 +1415,14 @@ fun LiveArtModeScreen(
                         )
                     }
                 }
+            }
+
+            if (selectedType == liveTypes.first() && selectedCities.isEmpty()) {
+                Text(
+                    text = "Validation: Select at least one city for physical live art.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A)
+                )
             }
 
             Text(
@@ -1051,11 +1463,42 @@ fun LiveArtModeScreen(
                     }
                 }
             }
+
+            if (selectedType == liveTypes.first() && selectedRadius == null) {
+                Text(
+                    text = "Validation: Select a travel radius for physical live art.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A)
+                )
+            }
         }
 
         Column(modifier = Modifier.fillMaxWidth()) {
+            val viewModel = LocalArtistViewModel.current
+            val scope = rememberCoroutineScope()
+            var isSaving by remember { mutableStateOf(false) }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        try {
+                            viewModel.updateState {
+                                it.copy(
+                                    liveArtMode = selectedType.orEmpty(),
+                                    liveArtCities = selectedCities,
+                                    liveArtRadius = selectedRadius
+                                        ?.filter { ch -> ch.isDigit() }
+                                        ?.toFloatOrNull() ?: 0f
+                                )
+                            }
+                            viewModel.saveIncrementalState()
+                            onNext()
+                        } catch (e: Exception) {
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 enabled = canContinue,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1090,8 +1533,15 @@ fun LiveArtServiceTypesScreen(
         LiveServiceOption("Corporate Event Mural", R.drawable.live_service_corporate_event),
         LiveServiceOption("Other", R.drawable.live_service_other)
     )
-    var selectedService by remember { mutableStateOf<String?>(null) }
-    val canContinue = selectedService != null
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    
+    var selectedService by remember(state.liveArtServiceTypes) { mutableStateOf(state.liveArtServiceTypes.firstOrNull()) }
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    
+    val canContinue = selectedService != null && !isSaving
 
     Column(
         modifier = Modifier
@@ -1112,7 +1562,7 @@ fun LiveArtServiceTypesScreen(
             )
 
             Text(
-                text = "Step 7 of 11",
+                text = "Step 6 of 14",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary
             )
@@ -1179,20 +1629,25 @@ fun LiveArtAvailableDatesScreen(
     onSave: () -> Unit
 ) {
     val monthFormatter = remember { DateTimeFormatter.ofPattern("MMMM yyyy", Locale.ENGLISH) }
-    val chargeOptions = listOf("\u20B95,000", "\u20B910,000", "\u20B920,000", "Custom Price")
+    val presetChargeOptions = listOf("\u20B95,000", "\u20B910,000", "\u20B920,000")
+    val customChargeOption = "Custom Price"
     var displayedMonth by remember { mutableStateOf(YearMonth.of(2024, 4)) }
-    var selectedDates by remember {
-        mutableStateOf(
-            setOf(
-                LocalDate.of(2024, 4, 22),
-                LocalDate.of(2024, 4, 23),
-                LocalDate.of(2024, 4, 24),
-                LocalDate.of(2024, 4, 29)
-            )
-        )
+    var selectedDates by remember { mutableStateOf(emptySet<LocalDate>()) }
+    var selectedCharge by remember { mutableStateOf<String?>(null) }
+    var customChargeInput by remember { mutableStateOf("") }
+    var showDateValidation by remember { mutableStateOf(false) }
+    var showChargeValidation by remember { mutableStateOf(false) }
+    val isCustomChargeSelected = selectedCharge == customChargeOption
+    val customChargeValue = customChargeInput.toIntOrNull()
+    val customChargeError = if (isCustomChargeSelected && customChargeInput.isNotBlank() && customChargeValue == null) {
+        "Enter a valid amount"
+    } else {
+        null
     }
-    var selectedCharge by remember { mutableStateOf(chargeOptions.first()) }
-    val canSave = selectedDates.isNotEmpty() && selectedCharge.isNotBlank()
+    val hasValidCharge = when {
+        isCustomChargeSelected -> customChargeValue != null && customChargeValue > 0
+        else -> !selectedCharge.isNullOrBlank()
+    }
     val monthDates = remember(displayedMonth) { buildCalendarDates(displayedMonth) }
 
     Column(
@@ -1215,7 +1670,7 @@ fun LiveArtAvailableDatesScreen(
             )
 
             Text(
-                text = "Step 8 of 11",
+                text = "Step 7 of 14",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary
             )
@@ -1299,6 +1754,7 @@ fun LiveArtAvailableDatesScreen(
                                 dates = week,
                                 selectedDates = selectedDates,
                                 onDateClick = { date ->
+                                    showDateValidation = false
                                     selectedDates = if (selectedDates.contains(date)) {
                                         selectedDates - date
                                     } else {
@@ -1309,6 +1765,14 @@ fun LiveArtAvailableDatesScreen(
                         }
                     }
                 }
+            }
+
+            if (showDateValidation && selectedDates.isEmpty()) {
+                Text(
+                    text = "Please select at least one available date to continue.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A)
+                )
             }
 
             Surface(
@@ -1333,27 +1797,90 @@ fun LiveArtAvailableDatesScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        chargeOptions.forEach { option ->
-                            val selected = selectedCharge == option
-                            Box(
+                        presetChargeOptions.forEach { option ->
+                            PriceOptionChip(
+                                modifier = Modifier.weight(1f),
+                                label = option,
+                                selected = selectedCharge == option,
+                                onClick = {
+                                    selectedCharge = option
+                                    showChargeValidation = false
+                                }
+                            )
+                        }
+                    }
+
+                    PriceOptionChip(
+                        modifier = Modifier.fillMaxWidth(),
+                        label = customChargeOption,
+                        selected = isCustomChargeSelected,
+                        subtitle = if (isCustomChargeSelected) "Enter your own minimum booking amount" else "Set a custom amount manually",
+                        onClick = {
+                            selectedCharge = customChargeOption
+                            showChargeValidation = false
+                        }
+                    )
+
+                    if (isCustomChargeSelected) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
                                 modifier = Modifier
-                                    .weight(1f)
-                                    .background(
-                                        if (selected) BurntOrange else Color(0xFFFBF6F1),
-                                        RoundedCornerShape(20.dp)
+                                    .fillMaxWidth()
+                                    .background(Color(0xFFFBF6F1), RoundedCornerShape(18.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (customChargeError == null) BurntOrange.copy(alpha = 0.28f) else Color(0xFFB04A2A),
+                                        shape = RoundedCornerShape(18.dp)
                                     )
-                                    .clickable { selectedCharge = option }
-                                    .padding(vertical = 14.dp, horizontal = 8.dp),
-                                contentAlignment = Alignment.Center
+                                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = option,
-                                    color = if (selected) Color.White else TextSecondary,
-                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                                    textAlign = TextAlign.Center
+                                    text = "Rs",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                                    color = BurntOrange
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                BasicTextField(
+                                    value = customChargeInput,
+                                    onValueChange = { value ->
+                                        customChargeInput = value.filter { it.isDigit() }.take(6)
+                                        showChargeValidation = false
+                                    },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions.Default.copy(
+                                        keyboardType = KeyboardType.Number,
+                                        imeAction = ImeAction.Done
+                                    ),
+                                    textStyle = MaterialTheme.typography.titleMedium.copy(color = TextPrimary),
+                                    decorationBox = { innerTextField ->
+                                        if (customChargeInput.isBlank()) {
+                                            Text(
+                                                text = "Enter minimum booking amount",
+                                                style = MaterialTheme.typography.bodyLarge,
+                                                color = TextSecondary
+                                            )
+                                        }
+                                        innerTextField()
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
                                 )
                             }
+
+                            Text(
+                                text = customChargeError ?: "This will be shown as the starting price for live event bookings.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = customChargeError?.let { Color(0xFFB04A2A) } ?: TextSecondary
+                            )
                         }
+                    }
+
+                    if (showChargeValidation && !hasValidCharge) {
+                        Text(
+                            text = "Please select or enter the minimum booking amount to continue.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFFB04A2A)
+                        )
                     }
                 }
             }
@@ -1361,8 +1888,20 @@ fun LiveArtAvailableDatesScreen(
 
         Column(modifier = Modifier.fillMaxWidth()) {
             Button(
-                onClick = onSave,
-                enabled = canSave,
+                onClick = {
+                    val missingDates = selectedDates.isEmpty()
+                    val missingCharge = !hasValidCharge
+                    if (missingDates) {
+                        showDateValidation = true
+                    }
+                    if (missingCharge) {
+                        showChargeValidation = true
+                    }
+                    if (!missingDates && !missingCharge) {
+                        onSave()
+                    }
+                },
+                enabled = true,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(64.dp),
@@ -1377,6 +1916,47 @@ fun LiveArtAvailableDatesScreen(
                 Text(text = "Save", fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
             Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+}
+
+@Composable
+private fun PriceOptionChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    subtitle: String? = null
+) {
+    Column(
+        modifier = modifier
+            .background(
+                if (selected) BurntOrange else Color(0xFFFBF6F1),
+                RoundedCornerShape(20.dp)
+            )
+            .border(
+                width = 1.dp,
+                color = if (selected) BurntOrange else BorderSoft,
+                shape = RoundedCornerShape(20.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(
+            text = label,
+            color = if (selected) Color.White else TextSecondary,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+            textAlign = TextAlign.Center
+        )
+        subtitle?.let {
+            Text(
+                text = it,
+                color = if (selected) Color.White.copy(alpha = 0.9f) else TextSecondary,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center
+            )
         }
     }
 }
@@ -1649,10 +2229,16 @@ fun PriceRangeScreen(
     fun priceToSlider(price: Float): Float = (ln(price / minPrice) / logBase).coerceIn(0f, 1f)
     fun sliderToPrice(slider: Float): Float = (minPrice * exp(logBase * slider)).coerceIn(minPrice, maxPrice)
 
-    var priceValue by remember { mutableStateOf(2500f) }
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    
+    var priceValue by remember(state.basePriceRange) { mutableStateOf(state.basePriceRange) }
     var sliderPosition by remember { mutableStateOf(priceToSlider(priceValue)) }
-    var priceText by remember { mutableStateOf("") }
-    val canContinuePrice = priceText.isNotBlank()
+    var priceText by remember(state.basePriceRange) { mutableStateOf(state.basePriceRange.toInt().toString()) }
+    val canContinuePrice = priceText.isNotBlank() && !isSaving
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1673,7 +2259,7 @@ fun PriceRangeScreen(
             )
 
             Text(
-                text = "Step 5 of 10",
+                text = "Step 9 of 14",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary
             )
@@ -1822,8 +2408,30 @@ fun PriceRangeScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            errorMessage?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                )
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            viewModel.updateState { it.copy(basePriceRange = priceValue) }
+                            viewModel.saveIncrementalState()
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 enabled = canContinuePrice,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1854,10 +2462,16 @@ fun CustomizationScreen(
 ) {
     val yesNo = listOf("Yes", "No")
     val timeOptions = listOf("< 2 days", "2-5 days", "5-10 days")
-    var customization by remember { mutableStateOf<String?>(null) }
-    var avgTime by remember { mutableStateOf<String?>(null) }
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    
+    var customization by remember(state.offersCustomization) { mutableStateOf<String?>(if (state.offersCustomization) "Yes" else "No") }
+    var avgTime by remember(state.customizationTime) { mutableStateOf(state.customizationTime.takeIf { it.isNotBlank() }) }
     val canSelectAvgTime = customization == "Yes"
-    val canContinueCustomization = customization != null && (customization == "No" || avgTime != null)
+    val canContinueCustomization = customization != null && (customization == "No" || avgTime != null) && !isSaving
 
     Column(
         modifier = Modifier
@@ -1879,7 +2493,7 @@ fun CustomizationScreen(
             )
 
             Text(
-                text = "Step 6 of 10",
+                text = "Step 10 of 14",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary
             )
@@ -1971,8 +2585,28 @@ fun CustomizationScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            errorMessage?.let {
+                Text(text = it, style = MaterialTheme.typography.bodySmall, color = Color(0xFFB04A2A), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            viewModel.updateState { it.copy(
+                                offersCustomization = customization == "Yes",
+                                customizationTime = avgTime ?: ""
+                            )}
+                            viewModel.saveIncrementalState()
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 enabled = canContinueCustomization,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2004,14 +2638,20 @@ fun CapacityScreen(
     val bulkOrderOptions = listOf("Yes", "No", "Sometimes")
     val capacityOptions = listOf("< 10", "10-25", "25-50", "50+")
     val timeOptions = listOf("5-10 days", "10-20 days", "20-30 days")
-    var selectedBulkOrder by remember { mutableStateOf<String?>(null) }
-    var selectedCapacity by remember { mutableStateOf<String?>(null) }
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    
+    var selectedBulkOrder by remember(state.acceptsBulkOrders) { mutableStateOf<String?>(if (state.acceptsBulkOrders) "Yes" else "No") }
+    var selectedCapacity by remember(state.bulkCapacity) { mutableStateOf(state.bulkCapacity.takeIf { it.isNotBlank() }) }
     var avgTime by remember { mutableStateOf<String?>(null) }
     val areCapacityFieldsEnabled = selectedBulkOrder != null && selectedBulkOrder != "No"
     val canContinueCapacity = when (selectedBulkOrder) {
         null -> false
-        "No" -> true
-        else -> selectedCapacity != null && avgTime != null
+        "No" -> !isSaving
+        else -> selectedCapacity != null && avgTime != null && !isSaving
     }
 
     Column(
@@ -2034,7 +2674,7 @@ fun CapacityScreen(
             )
 
             Text(
-                text = "Step 7 of 10",
+                text = "Step 11 of 14",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary
             )
@@ -2153,8 +2793,28 @@ fun CapacityScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            errorMessage?.let {
+                Text(text = it, style = MaterialTheme.typography.bodySmall, color = Color(0xFFB04A2A), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            viewModel.updateState { it.copy(
+                                acceptsBulkOrders = selectedBulkOrder == "Yes" || selectedBulkOrder == "Sometimes",
+                                bulkCapacity = selectedCapacity ?: ""
+                            )}
+                            viewModel.saveIncrementalState()
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 enabled = canContinueCapacity,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2184,9 +2844,15 @@ fun MaterialScreen(
     onNext: () -> Unit
 ) {
     val materials = listOf("Resin", "Beads", "Wool", "Clay", "Wood", "Acrylic")
-    var selectedMaterials by remember { mutableStateOf(emptySet<String>()) }
+    val viewModel = LocalArtistViewModel.current
+    val state by viewModel.state.collectAsState()
+    val scope = rememberCoroutineScope()
+    var selectedMaterials by remember(state.materials) { mutableStateOf(state.materials) }
     var otherMaterial by remember { mutableStateOf("") }
-    val canContinueMaterial = selectedMaterials.isNotEmpty()
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val isOtherSelected = selectedMaterials.contains("Other")
+    val canContinueMaterial = selectedMaterials.isNotEmpty() && (!isOtherSelected || otherMaterial.isNotBlank()) && !isSaving
 
     Column(
         modifier = Modifier
@@ -2208,7 +2874,7 @@ fun MaterialScreen(
             )
 
             Text(
-                text = "Step 4 of 10",
+                text = "Step 8 of 14",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary
             )
@@ -2235,7 +2901,10 @@ fun MaterialScreen(
                         unselectedContainerColor = Color(0xFFF3E9DD),
                         selectedBorderColor = BorderSoft,
                         unselectedBorderColor = BorderSoft,
-                        textStyle = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium)
+                        textStyle = MaterialTheme.typography.bodySmall.copy(
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 14.sp
+                        )
                     )
                 }
             }
@@ -2253,7 +2922,10 @@ fun MaterialScreen(
                         unselectedContainerColor = Color(0xFFF3E9DD),
                         selectedBorderColor = BorderSoft,
                         unselectedBorderColor = BorderSoft,
-                        textStyle = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium)
+                        textStyle = MaterialTheme.typography.bodySmall.copy(
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 14.sp
+                        )
                     )
                 }
             }
@@ -2262,8 +2934,14 @@ fun MaterialScreen(
                 Spacer(modifier = Modifier.weight(1f))
                 PillOption(
                     label = "Other",
-                    selected = selectedMaterials.contains("Other"),
-                    onClick = { selectedMaterials = selectedMaterials.toggle("Other") },
+                    selected = isOtherSelected,
+                    onClick = {
+                        val updatedMaterials = selectedMaterials.toggle("Other")
+                        selectedMaterials = updatedMaterials
+                        if (!updatedMaterials.contains("Other")) {
+                            otherMaterial = ""
+                        }
+                    },
                     modifier = Modifier.weight(1f),
                     cornerRadius = 10.dp,
                     height = 36.dp,
@@ -2271,18 +2949,29 @@ fun MaterialScreen(
                     unselectedContainerColor = Color(0xFFF3E9DD),
                     selectedBorderColor = BorderSoft,
                     unselectedBorderColor = BorderSoft,
-                    textStyle = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium)
+                    textStyle = MaterialTheme.typography.bodySmall.copy(
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 14.sp
+                    )
                 )
                 Spacer(modifier = Modifier.weight(1f))
             }
 
-            if (selectedMaterials.contains("Other")) {
+            if (isOtherSelected) {
                 InputField(
                     value = otherMaterial,
                     onValueChange = { otherMaterial = it },
                     label = " ",
                     placeholder = "Type your material"
                 )
+
+                if (otherMaterial.isBlank()) {
+                    Text(
+                        text = "Please enter the material name to continue.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFB04A2A)
+                    )
+                }
             }
         }
 
@@ -2290,8 +2979,35 @@ fun MaterialScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            errorMessage?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                )
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            val materialsToSave = if (isOtherSelected && otherMaterial.isNotBlank()) {
+                                (selectedMaterials - "Other") + otherMaterial.trim()
+                            } else {
+                                selectedMaterials
+                            }
+                            viewModel.updateState { it.copy(materials = materialsToSave) }
+                            viewModel.saveIncrementalState()
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save materials"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
                 enabled = canContinueMaterial,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2305,7 +3021,7 @@ fun MaterialScreen(
                 )
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = "Next")
+                    Text(text = if (isSaving) "Saving..." else "Next")
                     Spacer(modifier = Modifier.width(6.dp))
                     Icon(imageVector = Icons.Default.ChevronRight, contentDescription = null)
                 }
@@ -2343,6 +3059,12 @@ fun DeliveryScreen(
                 contentDescription = "Back",
                 tint = TextSecondary,
                 modifier = Modifier.clickable { onBack() }
+            )
+
+            Text(
+                text = "Step 12 of 14",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary
             )
 
             Text(
@@ -2490,6 +3212,12 @@ fun UploadPhotosScreen(
             )
 
             Text(
+                text = "Step 13 of 14",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary
+            )
+
+            Text(
                 text = "Upload photos of your original work",
                 style = MaterialTheme.typography.headlineSmall.copy(
                     fontWeight = FontWeight.Medium,
@@ -2550,11 +3278,15 @@ fun ArtistStoryScreen(
     onBack: () -> Unit,
     onNext: () -> Unit
 ) {
+    val viewModel = LocalArtistViewModel.current
+    val scope = rememberCoroutineScope()
     var story by remember {
         mutableStateOf(
             "I grew up watching my mother weave stories into textiles, and I bring that tradition into every piece I make."
         )
     }
+    var isSaving by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -2571,6 +3303,12 @@ fun ArtistStoryScreen(
                 contentDescription = "Back",
                 tint = TextSecondary,
                 modifier = Modifier.clickable { onBack() }
+            )
+
+            Text(
+                text = "Step 14 of 14",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary
             )
 
             Text(
@@ -2597,8 +3335,35 @@ fun ArtistStoryScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            errorMessage?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB04A2A),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                )
+            }
             Button(
-                onClick = onNext,
+                onClick = {
+                    scope.launch {
+                        isSaving = true
+                        errorMessage = null
+                        try {
+                            viewModel.updateState { it.copy(storyBio = story) }
+                            viewModel.saveIncrementalState()
+                            com.titu.artistonboard.supabase.SupabaseArtistOnboardingRepository()
+                                .updateArtistProfilePartial(kotlinx.serialization.json.buildJsonObject {
+                                    put("onboarding_status", "completed")
+                                })
+                            onNext()
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Failed to save artist story"
+                        } finally {
+                            isSaving = false
+                        }
+                    }
+                },
+                enabled = !isSaving,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
@@ -2609,7 +3374,7 @@ fun ArtistStoryScreen(
                 )
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = "Next")
+                    Text(text = if (isSaving) "Saving..." else "Next")
                     Spacer(modifier = Modifier.width(6.dp))
                     Icon(imageVector = Icons.Default.ChevronRight, contentDescription = null)
                 }
@@ -2832,15 +3597,15 @@ fun ProfileSetupScreen(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
-                            text = "• Analyzing your style...",
+                            text = "Ã¢â‚¬Â¢ Analyzing your style...",
                             style = MaterialTheme.typography.bodyLarge.copy(color = Color.White)
                         )
                         Text(
-                            text = "• Detecting buyer segments...",
+                            text = "Ã¢â‚¬Â¢ Detecting buyer segments...",
                             style = MaterialTheme.typography.bodyLarge.copy(color = Color.White)
                         )
                         Text(
-                            text = "• Optimizing pricing...",
+                            text = "Ã¢â‚¬Â¢ Optimizing pricing...",
                             style = MaterialTheme.typography.bodyLarge.copy(color = Color.White)
                         )
                     }
